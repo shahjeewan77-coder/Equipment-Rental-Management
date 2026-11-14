@@ -1,0 +1,16 @@
+import pg from "pg";
+import fs from "fs";
+const url = fs.readFileSync("/tmp/dburl.txt","utf8").trim();
+const c = new pg.Client({ connectionString: url, ssl: { rejectUnauthorized: false } });
+await c.connect();
+const o = await c.query("select id,status,locked_by_driver_id,transit_vehicle_id,vehicle_id from orders where status='on_transit'");
+console.log("ON_TRANSIT:", JSON.stringify(o.rows,null,1));
+const d = await c.query("select id,name,user_id,is_active from drivers");
+console.log("DRIVERS:", JSON.stringify(d.rows,null,1));
+const p = await c.query("select user_id,role,display_name,username from profiles");
+console.log("PROFILES:", JSON.stringify(p.rows,null,1));
+const u = await c.query("select id,email,name,role from users");
+console.log("USERS:", JSON.stringify(u.rows,null,1));
+const ms = await c.query("select * from message_settings");
+console.log("MSG_SETTINGS:", JSON.stringify(ms.rows));
+await c.end();

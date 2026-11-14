@@ -1,0 +1,14 @@
+import pg from "pg";
+import fs from "fs";
+const url = fs.readFileSync("/tmp/dburl.txt","utf8").trim();
+const c = new pg.Client({ connectionString: url, ssl: { rejectUnauthorized: false } });
+await c.connect();
+const cust = await c.query("select id,name,phone from customers order by name limit 20");
+console.log("CUSTOMERS:", JSON.stringify(cust.rows, null, 1));
+const ord = await c.query("select id,status,customer_id from orders order by created_at desc limit 12");
+console.log("ORDERS:", JSON.stringify(ord.rows, null, 1));
+const ms = await c.query("select * from message_settings");
+console.log("MESSAGE_SETTINGS:", JSON.stringify(ms.rows));
+const sms = await c.query("select event,status,to_number,customer_name from sms_notifications order by created_at desc limit 5");
+console.log("SMS_LOG:", JSON.stringify(sms.rows));
+await c.end();
