@@ -3163,7 +3163,7 @@ export async function deleteVehicle(accountId: string, vehicleId: string) {
   return { ok: true as const, mode: "deleted" as const, summary };
 }
 
-// ── receipts / invoices ─────────────────────────────────────────────────────
+// ── receipts / invoices ────────────────────────────────────────────────     
 
 export async function editReceipt(
   accountId: string,
