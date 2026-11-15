@@ -137,10 +137,6 @@ export async function createCustomer(input: {
   address?: string | null;
 }) {
   // ── duplicate guard ──
-  // Same name AND same phone (case-insensitive, formatting-insensitive) is the
-  // same customer. Checked here rather than only in the browser so a direct API
-  // call, the order form's inline create and the Customers page all hit the same
-  // rule. Thrown as a plain Error with a message the router maps to CONFLICT.
   const existing = await listCustomers(input.ownerId);
   const dup = findDuplicateCustomer(existing, { name: input.name, phone: input.phone });
   if (dup) throw new DuplicateCustomerError(duplicateCustomerMessage(dup), dup.id, dup.name);
@@ -157,12 +153,6 @@ export async function createCustomer(input: {
   return row;
 }
 
-/**
- * A customer that already exists with this name + phone.
- *
- * A dedicated class so the router can map it to a CONFLICT without string-
- * matching a message, and so the client can show the existing customer's name.
- */
 export class DuplicateCustomerError extends Error {
   constructor(
     message: string,
@@ -174,7 +164,6 @@ export class DuplicateCustomerError extends Error {
   }
 }
 
-/** Set a customer's opening (carried-in) due. Owner-only, validated by the router. */
 export async function setCustomerOpeningBalance(accountId: string, customerId: string, openingBalance: number) {
   const [row] = await db
     .update(customers)
@@ -190,13 +179,6 @@ export async function listVehicles(accountId: string) {
   return db.select().from(vehicles).where(eq(vehicles.ownerId, accountId)).orderBy(asc(vehicles.name));
 }
 
-/**
- * Only the trucks still in service — what every picker should offer.
- *
- * A retired vehicle keeps its row (so history still names it) but must not be
- * offered for a new order or a driver's daily assignment; the server checks the
- * same list when a vehicle id arrives, so a stale client cannot sneak one in.
- */
 export async function listActiveVehicles(accountId: string) {
   return db
     .select()
@@ -218,7 +200,6 @@ export async function createVehicle(input: {
   return row;
 }
 
-/** A plate/name clash inside one business, case-insensitively, excluding `exceptId`. */
 export async function findVehicleByNumber(accountId: string, number: string, exceptId?: string) {
   const rows = await db
     .select({ id: vehicles.id, name: vehicles.name, number: vehicles.number })
@@ -227,13 +208,6 @@ export async function findVehicleByNumber(accountId: string, number: string, exc
   return rows.find((r) => r.id !== exceptId) ?? null;
 }
 
-/**
- * Edit a vehicle in place. Every field is fair game — the plate is the identity
- * the owner reads off the truck, so a typo in it must be fixable.
- *
- * Returns `{ ok: false, reason: "duplicate" }` when another vehicle in the same
- * business already carries that number, rather than letting two rows diverge.
- */
 export async function editVehicleRow(
   accountId: string,
   vehicleId: string,
@@ -272,7 +246,6 @@ export async function getVehicle(accountId: string, vehicleId: string) {
   return row ?? null;
 }
 
-/** Put a retired vehicle back into service. */
 export async function reactivateVehicle(accountId: string, vehicleId: string) {
   const [row] = await db
     .update(vehicles)
@@ -282,7 +255,6 @@ export async function reactivateVehicle(accountId: string, vehicleId: string) {
   return row ?? null;
 }
 
-/** Retire a vehicle without deleting the row, so every past record still names it. */
 export async function deactivateVehicle(accountId: string, vehicleId: string) {
   const [row] = await db
     .update(vehicles)
@@ -298,7 +270,6 @@ export async function listDrivers(accountId: string) {
   return db.select().from(drivers).where(eq(drivers.ownerId, accountId)).orderBy(asc(drivers.name));
 }
 
-/** Only the drivers still on the roster — what every picker should offer. */
 export async function listActiveDrivers(accountId: string) {
   return db
     .select()
@@ -307,11 +278,6 @@ export async function listActiveDrivers(accountId: string) {
     .orderBy(asc(drivers.name));
 }
 
-/**
- * What removing a driver from the roster affects. Removing is a deactivation, so
- * NOTHING is deleted — this exists so the owner can be told, in plain numbers,
- * how much history still names the driver.
- */
 export async function driverDeleteSummary(accountId: string, driverId: string) {
   const [d] = await db
     .select()
@@ -344,8 +310,6 @@ export async function driverDeleteSummary(accountId: string, driverId: string) {
       .select({ id: vehicleAssignments.id })
       .from(vehicleAssignments)
       .where(and(eq(vehicleAssignments.ownerId, accountId), eq(vehicleAssignments.driverId, driverId))),
-    // Stock movements keep naming whoever carried the stock, so they are part of
-    // what a delete would strand.
     db
       .select({ id: stockMovements.id })
       .from(stockMovements)
@@ -356,9 +320,6 @@ export async function driverDeleteSummary(accountId: string, driverId: string) {
       .where(and(eq(auditLog.ownerId, accountId), eq(auditLog.entity, "driver"), eq(auditLog.targetId, driverId))),
   ]);
 
-  // A driver still holding an order cannot be removed: either they have it locked
-  // for dispatch (nobody else can dispatch it, and their location is what the map
-  // follows) or they are carrying it right now. Both must be resolved first.
   const [activeTrip] = await db
     .select({ id: orders.id, status: orders.status })
     .from(orders)
@@ -385,33 +346,18 @@ export async function driverDeleteSummary(accountId: string, driverId: string) {
     stockMovements: movements.length,
     auditEntries: audits.length,
     references,
-    /** Nothing names them, so the row can actually go. */
     canHardDelete: references === 0,
     activeTripStatus: activeTrip ? (activeTrip.status as string) : null,
     onActiveTrip: Boolean(activeTrip),
   };
 }
 
-/**
- * Remove a driver from the roster.
- *
- * This is a DEACTIVATION, not a row delete. A driver who has taken orders is part
- * of the business's history — deleting the row would blank their name off past
- * orders and routes, and `onDelete: set null` would silently turn "carried by
- * Kabiraj" into "carried by nobody". Deactivating keeps every record true while
- * removing them from the roster, the pickers and the login-gated workflows.
- *
- * Refused while the driver is on an active trip, so the owner's map is never
- * following somebody the system has just hidden.
- */
 export async function deactivateDriver(accountId: string, driverId: string) {
   const summary = await driverDeleteSummary(accountId, driverId);
   if (!summary) return { ok: false as const, reason: "not_found" as const };
   if (summary.alreadyInactive) return { ok: false as const, reason: "already_inactive" as const };
   if (summary.onActiveTrip) return { ok: false as const, reason: "on_active_trip" as const, summary };
 
-  // Nothing has ever named them — a driver added by mistake can simply go, so the
-  // roster is not left accumulating rows nobody ever worked with.
   if (summary.canHardDelete) {
     await db.delete(drivers).where(and(eq(drivers.id, driverId), eq(drivers.ownerId, accountId)));
     return { ok: true as const, mode: "deleted" as const, summary };
@@ -426,7 +372,6 @@ export async function deactivateDriver(accountId: string, driverId: string) {
   return { ok: true as const, mode: "deactivated" as const, summary, driver: row };
 }
 
-/** Put a deactivated driver back on the roster. */
 export async function reactivateDriver(accountId: string, driverId: string) {
   const [row] = await db
     .update(drivers)
@@ -436,20 +381,6 @@ export async function reactivateDriver(accountId: string, driverId: string) {
   return row ?? null;
 }
 
-/**
- * Rename / re-number a driver on the roster, and set the vehicle they are
- * driving today.
- *
- * Only the driver row is touched by the name/number fields: it is what orders,
- * routes and the live map name. A driver with no login is a normal roster entry,
- * so this must work without a user account behind it.
- *
- * Two things are checked before anything is written, because both are how a
- * roster goes wrong: a phone number already used by another driver (the phone is
- * also a login handle, so a duplicate is ambiguous at the login screen), and an
- * unknown vehicle. Both come back as a reason rather than a thrown error, so the
- * router can turn them into a message the owner can act on.
- */
 export async function editDriverRow(
   accountId: string,
   driverId: string,
@@ -457,7 +388,6 @@ export async function editDriverRow(
     name?: string;
     phone?: string | null;
     licenseNo?: string | null;
-    /** undefined = leave alone, null = clear today's vehicle. */
     vehicleId?: string | null;
   },
 ) {
@@ -492,9 +422,6 @@ export async function editDriverRow(
     after = row;
   }
 
-  // The vehicle a driver has today is its own row (one per driver per day), so
-  // clearing it is a delete and setting it is an upsert — the same table the
-  // driver's own home screen writes.
   if (patch.vehicleId !== undefined) {
     const today = kathmanduToday();
     if (patch.vehicleId === null) {
@@ -518,15 +445,6 @@ export async function editDriverRow(
     }
   }
 
-  // The login handle lives on the profile, not the driver row. Keep the display
-  // name in step so the two never disagree about who this is.
-  //
-  // A driver WITHOUT a login is a perfectly normal roster entry (they take orders
-  // on paper), and `before.userId` is then null. There is no profile row to keep
-  // in step, and passing "" into a uuid column throws
-  // `invalid input syntax for type uuid: ""` AFTER the driver row has already
-  // been updated — a half-success that reads as a total failure. So the profile
-  // write is skipped entirely when there is no login to write to.
   if (before.userId && (patch.name !== undefined || phone !== undefined)) {
     const setProfile: Record<string, unknown> = {};
     if (patch.name !== undefined) setProfile.displayName = patch.name.trim();
@@ -549,7 +467,6 @@ export async function getDriver(accountId: string, driverId: string) {
   return row ?? null;
 }
 
-/** A phone number already on the roster, excluding `exceptId`. */
 export async function findDriverByPhone(accountId: string, phone: string, exceptId?: string) {
   const rows = await db
     .select({ id: drivers.id, name: drivers.name, phone: drivers.phone })
@@ -732,17 +649,6 @@ export async function listStockMovements(accountId: string, equipmentId?: string
     .limit(200);
 }
 
-/**
- * All-time delivered-out / returned-in totals per item, aggregated in SQL.
- *
- * The Stock report used to roll these up in the browser from `listStockMovements`,
- * which is capped at 200 rows. That cap is invisible until an account passes 200
- * movements, and then the columns silently under-count while the closing figure
- * (computed from `on_rent_qty`) stays right — the same class of mismatch as the
- * range bug, just further away. Summing in the database has no cap and no
- * rounding drift, so the Stock report's columns are the true all-time figures
- * the movement log shows.
- */
 export async function stockMovementTotals(accountId: string) {
   const rows = await db
     .select({
@@ -763,22 +669,6 @@ export async function stockMovementTotals(accountId: string) {
   }));
 }
 
-// ── stock movement report (per item) ─────────────────────────────────────────
-
-/**
- * Everything behind the Stock report's per-item movement drill-down.
- *
- * Returns the item's own totals plus EVERY movement it ever had, oldest first.
- * The date-range slicing and the running balance are done by the shared, pure
- * `buildMovementReport` — deliberately, because a balance that depends on a
- * range must roll everything before the range into the opening figure, and that
- * arithmetic deserves a unit test rather than a place in a SQL string.
- *
- * Attribution: an `out` movement names whoever dispatched the trip (the locker
- * — the person it actually left with), an `in` movement names whoever handed it
- * back. Both come from the snapshot column when present, falling back to the
- * order's actors for movements recorded before the snapshot existed.
- */
 export async function stockMovementReport(accountId: string, equipmentId: string) {
   const [item] = await db
     .select({
@@ -798,8 +688,6 @@ export async function stockMovementReport(accountId: string, equipmentId: string
   const transiter = alias(drivers, "mv_transiter");
   const dispatcher = alias(drivers, "mv_dispatcher");
   const namedDriver = alias(drivers, "mv_named");
-  // The customer the stock was picked FROM, when it was not the godown. Distinct
-  // from `customers`, which is the order's own customer.
   const sourceCustomer = alias(customers, "mv_source_customer");
 
   const rows = await db
@@ -835,10 +723,6 @@ export async function stockMovementReport(accountId: string, equipmentId: string
     .where(and(eq(stockMovements.ownerId, accountId), eq(stockMovements.equipmentId, equipmentId)))
     .orderBy(asc(stockMovements.dateAd), asc(stockMovements.createdAt));
 
-  // Order numbers are derived, not stored: an order is identified by the day it
-  // was raised plus its position that day, which is stable and human-readable
-  // (ORD-2026-10-26-2). Recomputed here from the account's own orders so the
-  // label always matches what the Orders screen shows.
   const dayOrders = await db
     .select({ id: orders.id, dateAd: orders.orderDateAd, createdAt: orders.createdAt })
     .from(orders)
@@ -853,11 +737,6 @@ export async function stockMovementReport(accountId: string, equipmentId: string
   }
 
   const movements = rows.map((r) => {
-    // Which name belongs on THIS movement:
-    //   out → who dispatched it (the driver it left with)
-    //   in  → who handed it back
-    // The snapshot wins because it is what was true at the time; the order's
-    // actors are the fallback for movements recorded before it existed.
     const driverName =
       r.type === "out"
         ? (r.snapshotName ?? r.namedDriverName ?? r.dispatcherName ?? r.transiterName ?? null)
@@ -873,12 +752,8 @@ export async function stockMovementReport(accountId: string, equipmentId: string
       customerName: r.customerName ?? null,
       personName: driverName,
       personRole: driverName ? ("driver" as const) : null,
-      // A reversal is its own row in the ledger, so the history keeps both the
-      // mistake and the correction. The report labels it and shows the reason.
       reversalOfId: r.reversalOfId ?? null,
       note: r.note ?? null,
-      // "Pick From": the customer this stock came back from, when it was not the
-      // godown. `autoReturn` marks the movement a lock wrote automatically.
       sourceCustomerName: r.sourceCustomerName ?? null,
       autoReturn: Boolean(r.autoReturn),
       createdAt: (r.createdAt instanceof Date ? r.createdAt : new Date(r.createdAt)).toISOString(),
@@ -901,28 +776,12 @@ export async function stockMovementReport(accountId: string, equipmentId: string
 
 // ── orders ───────────────────────────────────────────────────────────────────
 
-// ── "Pick From" ──────────────────────────────────────────────────────────────
-//
-// Stock is not always in the godown. Some of it is out on rent at a customer's
-// site, and a new order can be filled from there instead of from the yard — the
-// truck collects it from that customer on the way. This is the query behind the
-// source picker on the Lock for Dispatch screen.
-//
-// The customer list is FILTERED to the items actually on the order: only a
-// customer who currently holds one of those items is offered, because offering
-// every customer would be a list of places the stock is not. A customer's
-// available quantity is what they still hold — `actualQty - returnedQty` summed
-// over their on-rent lines — so a customer who has already sent half of it back
-// is offered only the half they still have.
 export interface PickFromOption {
   orderItemId: string;
   equipmentId: string;
   equipmentName: string;
-  /** How much this line needs. */
   qty: number;
-  /** Free stock in the central godown (totalQty − onRentQty). */
   godownQty: number;
-  /** Customers currently holding this item, with what they still hold. */
   customers: Array<{ customerId: string; customerName: string; qty: number }>;
 }
 
@@ -933,9 +792,6 @@ export async function getPickFromOptions(accountId: string, orderId: string): Pr
   const equipmentIds = [...new Set(detail.items.map((it) => it.equipmentId))];
   if (equipmentIds.length === 0) return [];
 
-  // What each customer still holds, per item. `on_rent` only: an order that is
-  // merely on transit has not reached the customer yet, so its stock is not
-  // sitting at their site to be collected.
   const held = await db
     .select({
       equipmentId: orderItems.equipmentId,
@@ -989,26 +845,6 @@ export interface OrderItemInput {
   units: number;
 }
 
-// ── duplicate entry prevention ───────────────────────────────────────────────
-//
-// Two people (or the same person twice, on a flaky connection) can end up
-// submitting the same order. The check has to be here rather than in a form,
-// because a form is not the only way in — the API is.
-//
-// SCOPE, and why: an order only makes a new submission a DUPLICATE while it is
-// still live. Once it is RETURNED or REJECTED the equipment has come home, and
-// renting it to the same customer again is ordinary business — refusing that
-// would block the shop from working. So:
-//
-//   pending_approval / approved / on_transit / on_rent  → a repeat is a duplicate
-//   returned / rejected                                → a repeat is a new rental
-//
-// "Identical" means the same customer and the same items in the same quantities.
-// Rates are deliberately NOT part of the identity: re-quoting the same gear at a
-// new price while the first order is still live is still a double entry. Actual
-// Qty and Billed Qty ARE included, because they are the quantities that hit
-// stock and the invoice respectively.
-
 export const ACTIVE_ORDER_STATUSES = ["pending_approval", "approved", "on_transit", "on_rent"] as const;
 
 export const DUPLICATE_ORDER_MESSAGE =
@@ -1020,8 +856,6 @@ export interface FingerprintItem {
   billedQty: number;
 }
 
-/** Order-insensitive identity of a line set, so the same items entered in a
- *  different order still compare equal. */
 export function orderFingerprint(items: FingerprintItem[]): string {
   return items
     .map((i) => `${i.equipmentId}:${round2(Number(i.actualQty) || 0)}:${round2(Number(i.billedQty) || 0)}`)
@@ -1029,7 +863,6 @@ export function orderFingerprint(items: FingerprintItem[]): string {
     .join("|");
 }
 
-/** The id of a live order for this customer with identical contents, or null. */
 export async function findDuplicateOrder(
   accountId: string,
   customerId: string,
@@ -1098,8 +931,6 @@ export async function createOrder(input: {
     lineAmount: round2(it.rate * it.units * it.billedQty),
   }));
 
-  // `atomic` resolves to an ARRAY of result sets, one per statement — so the
-  // inserted order is the first row of the first result set.
   const [orderRows] = await atomic((d) => {
     const stmts = [
       d
@@ -1114,7 +945,6 @@ export async function createOrder(input: {
           orderDateAd: today.ad,
           orderDateBs: today.bsIso,
           notes: input.notes ?? null,
-          // Who TOOK the order. Null when the owner entered it themselves.
           createdByDriverId: input.driverId,
         })
         .returning(),
@@ -1128,15 +958,6 @@ export async function createOrder(input: {
 export async function listOrders(accountId: string, opts: { driverId?: string | null; status?: string }) {
   const conds = [eq(orders.ownerId, accountId)];
   if (opts.driverId) {
-    // A driver sees:
-    //   1. every order assigned to them (any status), and
-    //   2. every order THEY locked for dispatch — the locking driver keeps it
-    //      visible so they can actually dispatch it, even when the order was
-    //      assigned to a different driver, and
-    //   3. any unlocked approved order, which is available for any driver to
-    //      pick up and dispatch.
-    // A locked order stays hidden from every OTHER driver (rule 2 is scoped to
-    // the locker), which is what keeps two drivers from working the same order.
     conds.push(
       or(
         eq(orders.driverId, opts.driverId),
@@ -1147,11 +968,6 @@ export async function listOrders(accountId: string, opts: { driverId?: string | 
   }
   if (opts.status) conds.push(eq(orders.status, opts.status));
 
-  // Three different drivers can be on one order, so the name/vehicle shown has to
-  // be resolved per step rather than taken from the single `driverId` join:
-  //   · Transited by  → the LOCKER, and the locker's own vehicle (the trip)
-  //   · Dispatched by → whoever completed the dispatch
-  //   · otherwise     → whoever the order is assigned to, on its own vehicle
   const transiter = alias(drivers, "list_transiter");
   const dispatcher = alias(drivers, "list_dispatcher");
   const tripVehicle = alias(vehicles, "list_trip_vehicle");
@@ -1170,17 +986,12 @@ export async function listOrders(accountId: string, opts: { driverId?: string | 
       customerId: orders.customerId,
       createdAt: orders.createdAt,
       customerName: customers.name,
-      // Kept for whichever page just wants "the driver on this order".
       driverName: drivers.name,
       creatorName: drivers.name,
       transiterName: transiter.name,
       dispatcherName: dispatcher.name,
       vehicleName: vehicles.name,
       vehicleNumber: vehicles.number,
-      // The vehicle actually on the road. Once ANY driver locks the order, the
-      // trip is theirs, so only their vehicle counts — with none set this is null
-      // rather than the CREATING driver's truck. An order that was never locked
-      // has no trip, so it falls back to its own vehicle.
       transitVehicleName: sql<string | null>`CASE WHEN ${orders.lockedByDriverId} IS NOT NULL THEN ${tripVehicle.name} ELSE ${vehicles.name} END`,
       transitVehicleNumber: sql<string | null>`CASE WHEN ${orders.lockedByDriverId} IS NOT NULL THEN ${tripVehicle.number} ELSE ${vehicles.number} END`,
     })
@@ -1195,23 +1006,6 @@ export async function listOrders(accountId: string, opts: { driverId?: string | 
     .orderBy(desc(orders.createdAt));
 }
 
-/**
- * The equipment lines for MANY orders at once, for the Orders list.
- *
- * The list used to call `getOrder` once per row, which is an N+1: 40 orders meant
- * 40 round trips (each of which also fetched the invoice and the whole order
- * header) just to print a few equipment names. This is one query for the whole
- * page.
- *
- * Returns a Map keyed by order id so the caller can attach lines in O(1) per row.
- * Orders with no lines are simply absent from the map — the caller treats a miss
- * as "no equipment", which is also what an order with zero lines should show.
- *
- * `deliveredQty` is `actual_qty` (what physically left the godown) and
- * `invoicedQty` is `billed_qty` (what the invoice charges for). They are
- * deliberately NOT the same column: the whole point of showing both is to expose
- * the case where 10 went out and 8 were billed.
- */
 export async function listOrderLinesForOrders(
   accountId: string,
   orderIds: string[],
@@ -1245,18 +1039,10 @@ export async function listOrderLinesForOrders(
 }
 
 export async function getOrder(accountId: string, orderId: string) {
-  // The three actors are separate drivers, so each needs its own join — this is
-  // what lets a driver B lock (and be tracked for) an order driver A created.
   const creator = alias(drivers, "creator");
   const transiter = alias(drivers, "transiter");
   const dispatcher = alias(drivers, "dispatcher");
-  // The vehicle driven by whoever locked the order — the truck actually on the
-  // road, as distinct from `vehicleId`/`vehicles`, which is the one the order was
-  // created with.
   const tripVehicle = alias(vehicles, "trip_vehicle");
-  // The customer a line's stock was picked from ("Pick From"), for the order
-  // detail page. A separate alias because `customers` is already the order's own
-  // customer — the source is a DIFFERENT customer.
   const pickFromCustomer = alias(customers, "pick_from_customer");
 
   const [order] = await db
@@ -1277,8 +1063,6 @@ export async function getOrder(accountId: string, orderId: string) {
       approvedAt: orders.approvedAt,
       dispatchedAt: orders.dispatchedAt,
       createdAt: orders.createdAt,
-      // The delivery point captured at dispatch, distinct from the customer's
-      // saved site below. Null on orders dispatched before this existed.
       deliveryAddress: orders.deliveryAddress,
       deliveryLatitude: orders.deliveryLatitude,
       deliveryLongitude: orders.deliveryLongitude,
@@ -1296,7 +1080,6 @@ export async function getOrder(accountId: string, orderId: string) {
       dispatchedByName: dispatcher.name,
       vehicleName: vehicles.name,
       vehicleNumber: vehicles.number,
-      // The trip's vehicle: the locker's. No fallback to the creating driver's.
       transitVehicleName: tripVehicle.name,
       transitVehicleNumber: tripVehicle.number,
     })
@@ -1322,7 +1105,6 @@ export async function getOrder(accountId: string, orderId: string) {
       billedQty: orderItems.billedQty,
       units: orderItems.units,
       lineAmount: orderItems.lineAmount,
-      // Where this line's stock was picked from. Null = the godown.
       pickFromCustomerId: orderItems.pickFromCustomerId,
       pickFromCustomerName: pickFromCustomer.name,
       equipmentName: equipment.name,
@@ -1354,11 +1136,6 @@ export async function setOrderStatus(
     .returning();
   if (row) return row;
 
-  // The update matched nothing. That is only an error if the order is NOT
-  // already where this caller wanted it. Replaying a queued action (the offline
-  // outbox, or a double click) arrives here with the transition already done —
-  // and reporting that as a failure is what made the banner claim work had been
-  // lost when it had in fact been applied.
   const current = await getOrder(accountId, orderId);
   if (current && current.order.status === to) {
     return { ...current.order, alreadyApplied: true as const };
@@ -1366,23 +1143,6 @@ export async function setOrderStatus(
   return null;
 }
 
-/**
- * Lock an approved order for dispatch by a driver → status becomes on_transit.
- *
- * The locker becomes the order's TRANSITER and the one whose location is
- * tracked and the only one allowed to dispatch it. Recording it here (rather
- * than relying on `driverId`) is what lets a driver B lock an order that driver
- * A created: `driverId` stays A (the creator), `transitedByDriverId` is B.
- *
- * The locker's own vehicle is snapshotted onto the order here
- * (`transitVehicleId`). That is the whole point of the column: an order taken by
- * one driver and locked by another must show the LOCKER's truck on the road,
- * while `vehicleId` keeps the vehicle it was originally created with.
- *
- * `vehicleId` is optional — when the locker has no vehicle assigned today this
- * stays null, and the UI honestly shows no vehicle rather than inheriting the
- * creating driver's.
- */
 export async function lockOrderForDispatch(
   accountId: string,
   orderId: string,
@@ -1393,12 +1153,6 @@ export async function lockOrderForDispatch(
   const detail = await getOrder(accountId, orderId);
   if (!detail) return { ok: false as const, reason: "not_found" as const };
 
-  // ── "Pick From": work out what has to come back from a customer ────────────
-  //
-  // Everything is READ and ALLOCATED here, before the transaction, because
-  // `atomic` sends every statement at once and cannot branch on a result. Each
-  // allocation carries a SQL guard that re-checks the quantity it was computed
-  // from, so a concurrent pick cannot take the same units twice.
   const today = kathmanduToday();
   const byItem = new Map(sources.map((s) => [s.orderItemId, s.sourceCustomerId ?? null]));
 
@@ -1415,13 +1169,11 @@ export async function lockOrderForDispatch(
 
   for (const it of detail.items) {
     const customerId = byItem.get(it.id) ?? null;
-    if (!customerId) continue; // godown — nothing to bring back
+    if (!customerId) continue;
 
     const want = Number(it.actualQty);
     if (want <= 0) continue;
 
-    // The lines at that customer still holding this item, oldest first, so the
-    // stock that has been out longest is the stock that comes back.
     const held = await db
       .select({
         itemId: orderItems.id,
@@ -1476,7 +1228,6 @@ export async function lockOrderForDispatch(
     }
   }
 
-  // Which source orders end up fully picked, so they can be closed as returned.
   const sourceOrderIds = [...new Set(picks.map((p) => p.sourceOrderId))];
 
   const [row] = await atomic((d) => {
@@ -1500,8 +1251,6 @@ export async function lockOrderForDispatch(
         .returning(),
     ];
 
-    // Persist the chosen source on each line, so the order detail page can say
-    // where the stock came from long after the lock.
     for (const it of detail.items) {
       const customerId = byItem.get(it.id) ?? null;
       if (!customerId) continue;
@@ -1513,15 +1262,6 @@ export async function lockOrderForDispatch(
       );
     }
 
-    // The automatic "Return from <customer>" movements. Each one:
-    //   * belongs to the SOURCE order (that is the customer it came back from),
-    //     so that order's own ledger and closing figures stay true;
-    //   * is flagged `autoReturn` and linked to the order being locked, which is
-    //     how the owner's undo-lock finds exactly these and nothing else;
-    //   * takes the quantity off `onRentQty` — the stock has left the customer.
-    //     The dispatch that follows puts it straight back on rent, so the net
-    //     effect on stock on hand is zero, which is correct: the item is still
-    //     out on rent, just with a different customer.
     for (const p of picks) {
       stmts.push(
         d
@@ -1530,7 +1270,6 @@ export async function lockOrderForDispatch(
           .where(
             and(
               eq(orderItems.id, p.sourceItemId),
-              // Guard: only if nobody else has moved this line since we read it.
               sql`${orderItems.returnedQty} = ${p.sourceReturnedQty}`,
             ),
           ),
@@ -1560,9 +1299,6 @@ export async function lockOrderForDispatch(
       );
     }
 
-    // A source order whose every line has now been picked from is finished: it
-    // has nothing left at the customer, so it is closed as returned rather than
-    // sitting on the On Rent list claiming stock it no longer has.
     for (const sourceOrderId of sourceOrderIds) {
       stmts.push(
         d
@@ -1588,8 +1324,6 @@ export async function lockOrderForDispatch(
 
   if (row) return { ...row, autoReturns: picks.length };
 
-  // Already locked? Only the SAME driver replaying their own lock is a success;
-  // another driver finding it locked is a genuine refusal and stays null.
   const current = await getOrder(accountId, orderId);
   if (current && current.order.lockedByDriverId === driverId && current.order.status !== "approved") {
     return { ...current.order, alreadyApplied: true as const };
@@ -1597,23 +1331,6 @@ export async function lockOrderForDispatch(
   return null;
 }
 
-/** Dispatch: issue the sales invoice, move Actual Qty onto rent, log stock out.
- *
- * `driverId` is the driver making the call (null when the owner does it). Only
- * the driver who LOCKED the order may dispatch it, and the restriction is
- * enforced in SQL (the `locked_by_driver_id = ...` guard on the status update),
- * not just in the UI — so a second driver racing the same order gets a clean
- * refusal rather than a double dispatch.
- */
-/**
- * The delivery point captured on the dispatching driver's device.
- *
- * `status` is the honest record of what happened, and it is what decides whether
- * coordinates are stored at all:
- *   'captured'    — a real fix; lat/lng are required and stored
- *   'unavailable' — permission denied or no fix; NOTHING is stored but the status
- * A dispatch is never blocked by a missing fix, so this is always optional.
- */
 export interface DeliveryCapture {
   status: "captured" | "unavailable";
   latitude?: number | null;
@@ -1633,10 +1350,6 @@ export async function dispatchOrder(
   const detail = await getOrder(accountId, orderId);
   if (!detail) return { ok: false as const, reason: "not_found" as const };
 
-  // Replay of a dispatch that already happened. The order is past `on_transit`,
-  // so there is nothing to do — but that is SUCCESS, not a refusal: the trip is
-  // on the road, the invoice exists. Only the owner, the locker or whoever
-  // actually dispatched it may claim that; anyone else is still refused.
   if (detail.order.status === "on_rent" || detail.order.status === "returned") {
     const allowed =
       driverId === null ||
@@ -1649,7 +1362,6 @@ export async function dispatchOrder(
 
   if (detail.order.status !== "on_transit") return { ok: false as const, reason: "bad_status" as const };
 
-  // Only the driver who locked it may dispatch. The owner may always dispatch.
   const locker = detail.order.lockedByDriverId;
   if (driverId && locker && locker !== driverId) {
     return { ok: false as const, reason: "not_locker" as const };
@@ -1684,10 +1396,6 @@ export async function dispatchOrder(
           status: "on_rent",
           dispatchedAt: new Date(),
           dispatchedByDriverId: driverId ?? locker ?? null,
-          // The delivery point, captured on the dispatching device. Written in
-          // the SAME statement as the status change, so an order can never be
-          // on rent with a half-recorded location. `unavailable` stores the
-          // status and nothing else — no fake coordinates.
           deliveryLocationStatus: delivery?.status ?? null,
           deliveryLatitude: delivery?.status === "captured" ? (delivery.latitude ?? null) : null,
           deliveryLongitude: delivery?.status === "captured" ? (delivery.longitude ?? null) : null,
@@ -1700,9 +1408,6 @@ export async function dispatchOrder(
             eq(orders.id, orderId),
             eq(orders.ownerId, accountId),
             eq(orders.status, "on_transit"),
-            // The SQL guard for "only the locker may dispatch". `locked_by_driver_id
-            // IS NULL` covers an owner-created order that was approved without a
-            // driver ever locking it.
             driverId ? eq(orders.lockedByDriverId, driverId) : sql`TRUE`,
           ),
         )
@@ -1722,8 +1427,6 @@ export async function dispatchOrder(
           qty: it.actualQty,
           dateAd: today.ad,
           dateBs: today.bsIso,
-          // The stock left with the driver who dispatched it — which is the
-          // locker, not necessarily the driver who took the order.
           driverId: driverId ?? locker ?? null,
           actorName: actorName ?? null,
         }),
@@ -1736,7 +1439,6 @@ export async function dispatchOrder(
   return { ok: true as const, invoice: inv };
 }
 
-/** Pickup: rented products come back → off the On Rent list, back into Stock. */
 export async function returnOrder(
   accountId: string,
   orderId: string,
@@ -1745,8 +1447,6 @@ export async function returnOrder(
   const detail = await getOrder(accountId, orderId);
   if (!detail) return { ok: false as const, reason: "not_found" as const };
 
-  // Already picked up. Replaying the pickup must not restock the equipment a
-  // second time — and must not be reported as a failure either.
   if (detail.order.status === "returned") {
     return { ok: true as const, alreadyApplied: true as const, order: detail.order };
   }
@@ -1766,9 +1466,6 @@ export async function returnOrder(
           .set({ onRentQty: sql`GREATEST(${equipment.onRentQty} - ${it.actualQty}, 0)` })
           .where(and(eq(equipment.id, it.equipmentId), eq(equipment.ownerId, accountId))),
       ),
-      // The whole line has come back, so nothing is left at the customer. This is
-      // what the "Pick From" availability query reads: a returned order must stop
-      // offering stock it no longer holds.
       ...detail.items.map((it) =>
         d
           .update(orderItems)
@@ -1784,10 +1481,6 @@ export async function returnOrder(
           qty: it.actualQty,
           dateAd: today.ad,
           dateBs: today.bsIso,
-          // Whoever handed the stock back. A driver picking up on the road
-          // names themselves; an owner-received return falls back to the
-          // driver the order was running under, so the report never says
-          // "returned by nobody" for a trip that had a driver on it.
           driverId: actor.driverId ?? detail.order.lockedByDriverId ?? null,
           actorName: actor.actorName ?? null,
         }),
@@ -1799,47 +1492,16 @@ export async function returnOrder(
   return { ok: true as const };
 }
 
-// ── owner "undo" ─────────────────────────────────────────────────────────────
-//
-// Two mistakes the owner can make that used to be permanent: locking an order
-// for the wrong driver, and recording a return that never happened. Both are
-// reversed here, and both are written so that a second attempt cannot reverse
-// anything twice.
-//
-// The shape of every undo is the same:
-//   * a GUARDED update (the WHERE clause names the exact state being undone), so
-//     if anything moved on since, nothing is written and the caller is told;
-//   * the reversal is recorded as its own row rather than by editing history —
-//     for stock that is a `stock_movements` row pointing at the movement it
-//     reverses, which the UNIQUE index makes impossible to duplicate;
-//   * the before/after state is returned, so the router can put it in the audit
-//     trail with the owner's reason.
-
-/**
- * Undo a lock for dispatch: release the order back to `approved` so another
- * driver can take it.
- *
- * Refused once the order has been dispatched — a lock cannot be undone on its
- * own after the truck has left, because the dispatch, the invoice and the stock
- * movement all hang off it. The owner has to undo the dispatch first, and the
- * message says exactly that instead of failing vaguely.
- *
- * The creator is untouched: `createdByDriverId` and `driverId` still name
- * whoever took the order, so the history of who created it survives the undo.
- */
 export async function undoLockForDispatch(accountId: string, orderId: string) {
   const detail = await getOrder(accountId, orderId);
   if (!detail) return { ok: false as const, reason: "not_found" as const };
 
   const o = detail.order;
 
-  // Already dispatched (or further): the lock is no longer a standalone fact.
   if (o.status === "on_rent" || o.status === "returned") {
     return { ok: false as const, reason: "already_dispatched" as const, order: o };
   }
 
-  // Nothing to undo. Replaying the same undo is success, not a conflict — the
-  // order is already back where the owner wanted it.
   if (!o.lockedByDriverId && o.status !== "on_transit") {
     return { ok: true as const, alreadyApplied: true as const, before: o, after: o };
   }
@@ -1848,22 +1510,6 @@ export async function undoLockForDispatch(accountId: string, orderId: string) {
     return { ok: false as const, reason: "not_locked" as const, order: o };
   }
 
-  // The guarded update: only an order that is STILL on transit and STILL locked
-  // by the driver we just read is released. A dispatch that lands between the
-  // read and the write therefore wins, and this returns null.
-  //
-  // ── reversing the automatic "picked from a customer" returns ──
-  //
-  // If this lock was made with a "Pick from <customer>" source, it wrote `in`
-  // movements against the SOURCE orders and took that quantity off `onRentQty`.
-  // Releasing the lock has to put all of that back, or the stock would be
-  // stranded: the customer would still be holding it, but the app would think it
-  // had come home.
-  //
-  // Found by `autoReturnForOrderId` — the link the lock wrote — so this reverses
-  // exactly the movements THIS lock created and never a driver's real return.
-  // Each reversal is its own `out` row pointing at the `in` it undoes, and the
-  // UNIQUE index on `reversal_of_id` makes a second undo impossible.
   const autoReturns = await db
     .select({
       id: stockMovements.id,
@@ -1897,8 +1543,6 @@ export async function undoLockForDispatch(accountId: string, orderId: string) {
     qty: number;
   }>;
 
-  // Narrowed once, so the guarded update below compares against a real id rather
-  // than a nullable column value.
   const lockedBy = o.lockedByDriverId;
   if (!lockedBy) return { ok: false as const, reason: "not_locked" as const, order: o };
 
@@ -1925,7 +1569,6 @@ export async function undoLockForDispatch(accountId: string, orderId: string) {
         .returning(),
     ];
 
-    // The chosen source is no longer in force, so the order stops claiming it.
     for (const it of detail.items) {
       if (!it.pickFromCustomerId) continue;
       stmts.push(
@@ -1937,8 +1580,6 @@ export async function undoLockForDispatch(accountId: string, orderId: string) {
     }
 
     for (const m of toReverse) {
-      // The stock goes back to the customer it was picked from: the `in` is
-      // undone by an `out`, and `onRentQty` goes back up.
       stmts.push(
         d.insert(stockMovements).values({
           ownerId: accountId,
@@ -1960,7 +1601,6 @@ export async function undoLockForDispatch(accountId: string, orderId: string) {
           .set({ onRentQty: sql`${equipment.onRentQty} + ${m.qty}` })
           .where(and(eq(equipment.id, m.equipmentId), eq(equipment.ownerId, accountId))),
       );
-      // The source line is holding that quantity again.
       stmts.push(
         d
           .update(orderItems)
@@ -1973,7 +1613,6 @@ export async function undoLockForDispatch(accountId: string, orderId: string) {
             ),
           ),
       );
-      // A source order that the pick had closed is on rent again.
       stmts.push(
         d
           .update(orders)
@@ -1992,7 +1631,6 @@ export async function undoLockForDispatch(accountId: string, orderId: string) {
   });
 
   if (!row) {
-    // Lost the race. Re-read to say which way it went.
     const now = await getOrder(accountId, orderId);
     if (now && (now.order.status === "on_rent" || now.order.status === "returned")) {
       return { ok: false as const, reason: "already_dispatched" as const, order: now.order };
@@ -2006,41 +1644,12 @@ export async function undoLockForDispatch(accountId: string, orderId: string) {
   return { ok: true as const, before: o, after: row, reversedAutoReturns: toReverse.length };
 }
 
-/**
- * Undo a return: put the order back on rent and take the restocked quantity off
- * the shelf again.
- *
- * What is reversed, precisely:
- *   * the order goes `returned` → `on_rent`, so it is returnable again;
- *   * every `in` movement this order wrote gets a matching `out` reversal row
- *     (`reversalOfId` = the movement it reverses, `note` = the owner's reason),
- *     so the ledger keeps both the mistake and the correction and the running
- *     balance stays true;
- *   * `equipment.onRentQty` goes back UP by the same quantity, which is what
- *     makes the Stock report's closing figure agree with the ledger again.
- *
- * The invoice is NOT deleted or renumbered: a return never closed it in this
- * app (there is no "closed" state on an invoice — it is a record of what was
- * billed, and the money side is driven by receipts). Undoing a return therefore
- * leaves the invoice exactly as it was, which is the correct outcome: the
- * customer was billed for a rental that is, once again, still running.
- *
- * Idempotent by construction: the reversal rows carry a UNIQUE `reversal_of_id`,
- * so a second undo cannot insert a second set. It reports `alreadyApplied`
- * instead of double-restocking.
- */
 export async function undoReturnFromCustomer(accountId: string, orderId: string, reason: string | null = null) {
   const detail = await getOrder(accountId, orderId);
   if (!detail) return { ok: false as const, reason: "not_found" as const };
 
   const o = detail.order;
 
-  // The `in` movements this order wrote, and whether each is already reversed.
-  //
-  // `autoReturn` rows are EXCLUDED: those are the "picked from this customer"
-  // returns that ANOTHER order's lock wrote. They are reversed by undoing that
-  // lock, not by undoing this order's return — reversing them here would take
-  // stock off the shelf for a pick that is still in force.
   const inMoves = await db
     .select({ id: stockMovements.id, equipmentId: stockMovements.equipmentId, qty: stockMovements.qty })
     .from(stockMovements)
@@ -2062,19 +1671,14 @@ export async function undoReturnFromCustomer(accountId: string, orderId: string,
 
   const pending = inMoves.filter((m) => !reversed.has(m.id));
 
-  // Already undone: the order is back on rent and every return has a reversal.
-  // Success, not a conflict — nothing is written twice.
   if (o.status === "on_rent" && pending.length === 0) {
     return { ok: true as const, alreadyApplied: true as const, before: o, after: o, reversedMovements: 0 };
   }
 
-  // The state moved on since the return (e.g. it was dispatched again, or the
-  // order was edited into another status). Refuse rather than guess.
   if (o.status !== "returned") {
     return { ok: false as const, reason: "not_returned" as const, order: o };
   }
   if (pending.length === 0) {
-    // Status says returned but the ledger has no un-reversed return to undo.
     return { ok: false as const, reason: "nothing_to_reverse" as const, order: o };
   }
 
@@ -2082,27 +1686,20 @@ export async function undoReturnFromCustomer(accountId: string, orderId: string,
 
   const [ord] = await atomic((d) => {
     const stmts = [
-      // Guarded: only an order that is STILL `returned` goes back on rent.
       d
         .update(orders)
         .set({ status: "on_rent", returnedAt: null })
         .where(and(eq(orders.id, orderId), eq(orders.ownerId, accountId), eq(orders.status, "returned")))
         .returning(),
-      // Put the stock back on rent — the exact inverse of what the return did.
       ...pending.map((m) =>
         d
           .update(equipment)
           .set({ onRentQty: sql`${equipment.onRentQty} + ${m.qty}` })
           .where(and(eq(equipment.id, m.equipmentId), eq(equipment.ownerId, accountId))),
       ),
-      // The order is on rent again, so its lines are once more fully at the
-      // customer. Without this the "Pick From" list would keep offering stock
-      // that this order has just taken back.
       ...detail.items.map((it) =>
         d.update(orderItems).set({ returnedQty: 0 }).where(eq(orderItems.id, it.id)),
       ),
-      // The reversal rows. `reversalOfId` is UNIQUE, so a duplicate insert here
-      // fails the whole transaction rather than double-counting stock.
       ...pending.map((m) =>
         d.insert(stockMovements).values({
           ownerId: accountId,
@@ -2115,7 +1712,6 @@ export async function undoReturnFromCustomer(accountId: string, orderId: string,
           driverId: o.lockedByDriverId ?? null,
           actorName: null,
           reversalOfId: m.id,
-          // The owner's reason, so the ledger row explains itself.
           note: reason,
         }),
       ),
@@ -2140,9 +1736,6 @@ export async function undoReturnFromCustomer(accountId: string, orderId: string,
 }
 
 export async function listOnRent(accountId: string) {
-  // On rent IS the trip, so the driver and vehicle shown are the LOCKER's — an
-  // order taken by one driver and dispatched by another must name the driver
-  // who actually carried it.
   const transiter = alias(drivers, "rent_transiter");
   const tripVehicle = alias(vehicles, "rent_trip_vehicle");
   return db
@@ -2157,8 +1750,6 @@ export async function listOnRent(accountId: string) {
       vehicleName: tripVehicle.name,
       vehicleNumber: tripVehicle.number,
       invoiceNo: invoices.invoiceNo,
-      // The deployed equipment's actual location: captured at dispatch, with the
-      // customer's saved site as the fallback for older orders.
       deliveryAddress: orders.deliveryAddress,
       deliveryLatitude: orders.deliveryLatitude,
       deliveryLongitude: orders.deliveryLongitude,
@@ -2314,33 +1905,9 @@ export interface OrderEdit {
   driverId: string | null;
   vehicleId: string | null;
   notes: string | null;
-  /** "YYYY-MM-DD" in AD, or null to leave the order's date untouched. */
   orderDateAd: string | null;
 }
 
-/**
- * Owner edits every field of an order that is still awaiting approval, INCLUDING
- * replacing its line items wholesale. This is the single place an approved
- * order's money/stock inputs can be corrected before they are frozen.
- *
- * Written as ONE statement (a CTE), not an `atomic([...])` batch, because the
- * whole edit is a single unit of work with a single guard. It is atomic for
- * free — one statement is one implicit transaction — and the guard
- * (`status = 'pending_approval'`) is evaluated once and reused by the DELETE and
- * the INSERT, so a concurrent approve cannot leave the order with HALF-edited
- * lines:
- *
- *   * `ok`   — the guarded header update. Empty when the order is no longer
- *              pending, which is the "somebody got there first" signal.
- *   * `del`  — drops the old lines, gated on `ok`.
- *   * INSERT — writes the new lines, gated on `ok`. Per the Postgres rules on
- *              data-modifying CTEs, the sub-statements share one snapshot and
- *              cannot see each other's writes, so `del` can never delete the
- *              rows this INSERT adds regardless of execution order.
- *
- * Returns false (zero rows) when the order was not pending_approval — the caller
- * turns that into a CONFLICT rather than silently reporting success.
- */
 export async function updatePendingOrder(
   accountId: string,
   orderId: string,
@@ -2398,9 +1965,8 @@ export async function updatePendingOrder(
   return (rows[0]?.updated ?? 0) > 0;
 }
 
-// ── password reset (forgot-password OTP) ──────────────────────────────────────
+// ── password reset ────────────────────────────────────────────────────────────
 
-/** Find an account by email (case-insensitive). */
 export async function findUserByEmail(email: string) {
   const [row] = await db
     .select({ id: users.id, email: users.email, name: users.name })
@@ -2410,7 +1976,6 @@ export async function findUserByEmail(email: string) {
   return row ?? null;
 }
 
-/** Reset requests for one account since `since` — the per-user rate limit. */
 export async function countResetRequestsForUser(userId: string, since: Date): Promise<number> {
   const rows = await db
     .select({ id: passwordResetCodes.id })
@@ -2419,7 +1984,6 @@ export async function countResetRequestsForUser(userId: string, since: Date): Pr
   return rows.length;
 }
 
-/** Reset requests from one IP since `since` — the per-IP rate limit. */
 export async function countResetRequestsForIp(ip: string, since: Date): Promise<number> {
   const rows = await db
     .select({ id: passwordResetCodes.id })
@@ -2428,7 +1992,6 @@ export async function countResetRequestsForIp(ip: string, since: Date): Promise<
   return rows.length;
 }
 
-/** The newest request from this IP — drives the "wait N seconds" resend cooldown. */
 export async function latestResetRequestForIp(ip: string): Promise<{ createdAt: Date } | null> {
   const [row] = await db
     .select({ createdAt: passwordResetCodes.createdAt })
@@ -2439,7 +2002,6 @@ export async function latestResetRequestForIp(ip: string): Promise<{ createdAt: 
   return row ?? null;
 }
 
-/** Issue a code, invalidating any earlier unconsumed one for the same account. */
 export async function createResetCode(input: {
   userId: string;
   codeHash: string;
@@ -2465,7 +2027,6 @@ export async function createResetCode(input: {
   });
 }
 
-/** The account's current (unconsumed) code row. */
 export async function activeResetCode(userId: string) {
   const [row] = await db
     .select()
@@ -2476,7 +2037,6 @@ export async function activeResetCode(userId: string) {
   return row ?? null;
 }
 
-/** Count one failed attempt against a code so it cannot be brute-forced. */
 export async function bumpResetAttempts(id: string): Promise<void> {
   await db
     .update(passwordResetCodes)
@@ -2484,7 +2044,6 @@ export async function bumpResetAttempts(id: string): Promise<void> {
     .where(eq(passwordResetCodes.id, id));
 }
 
-/** Single-use: mark the code used. Zero rows means another call already used it. */
 export async function consumeResetCode(id: string): Promise<boolean> {
   const rows = await db
     .update(passwordResetCodes)
@@ -2494,25 +2053,12 @@ export async function consumeResetCode(id: string): Promise<boolean> {
   return rows.length > 0;
 }
 
-/** Write a new password hash for the account. */
 export async function setUserPassword(userId: string, passwordHash: string): Promise<void> {
   await db.update(users).set({ passwordHash }).where(eq(users.id, userId));
 }
 
 // ── customer ledger & receipts ────────────────────────────────────────────────
-//
-// A customer's ledger is DERIVED, never stored:
-//
-//     due = openingBalance + Σ sales invoices − Σ receipts
-//
-// Invoices are reached through the order they belong to (invoices has no
-// customerId of its own), so the join goes invoices → orders → customers, which
-// also keeps every row account-scoped by `orders.ownerId`.
 
-/**
- * Due balance for every customer in the account, as a Map keyed by customer id.
- * Used to show the current due on the Customers list in one round trip.
- */
 export async function customerDueMap(accountId: string): Promise> {
   const [custRows, invRows, recRows] = await Promise.all([
     db
@@ -2538,12 +2084,6 @@ export async function customerDueMap(accountId: string): Promise> {
   return map;
 }
 
-/**
- * One customer's full ledger: opening balance, every sales invoice (debit), every
- * receipt (credit) and the running/closing due. Entries are merged into a single
- * date-ordered series with a running balance, which is exactly what the ledger
- * page renders.
- */
 export async function getCustomerLedger(
   accountId: string,
   customerId: string,
@@ -2657,7 +2197,6 @@ export async function getCustomerLedger(
   };
 }
 
-/** Record money received from a customer. Returns the created receipt. */
 export async function createReceipt(input: {
   ownerId: string;
   customerId: string;
@@ -2687,7 +2226,6 @@ export async function createReceipt(input: {
   return row;
 }
 
-/** All receipts in the account, newest first, with the customer name. */
 export async function listReceipts(accountId: string) {
   return db
     .select({
