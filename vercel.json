@@ -4,22 +4,16 @@
     {
       "src": "package.json",
       "use": "@vercel/static-build",
-      "config": {
-        "distDir": "dist"
-      }
+      "config": { "distDir": "dist" }
+    },
+    {
+      "src": "server/_core/index.ts",
+      "use": "@vercel/node"
     }
   ],
   "routes": [
-    {
-      "handle": "filesystem"
-    },
-    {
-      "src": "/api/(.*)",
-      "dest": "/server/_core/index.ts"
-    },
-    {
-      "src": "/(.*)",
-      "dest": "/index.html"
-    }
+    { "src": "/api/(.*)", "dest": "server/_core/index.ts" },
+    { "src": "/trpc/(.*)", "dest": "server/_core/index.ts" },
+    { "src": "/(.*)", "dest": "/index.html" }
   ]
 }
