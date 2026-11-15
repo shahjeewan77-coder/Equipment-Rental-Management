@@ -2993,7 +2993,7 @@ export async function editCustomer(
   return row ?? null;
 }
 
-// ── equipment / vehicles ────────────────────────────────────────────────────
+// ── equipment / vehicles ────────────────────────────────────────────────    
 
 export async function equipmentCascadeSummary(accountId: string, equipmentId: string) {
   const [e] = await db
@@ -3163,7 +3163,7 @@ export async function deleteVehicle(accountId: string, vehicleId: string) {
   return { ok: true as const, mode: "deleted" as const, summary };
 }
 
-// ── receipts / invoices ────────────────────────────────────────────────     
+// ── receipts / invoices ─────────────────────────────────────────────────────
 
 export async function editReceipt(
   accountId: string,
