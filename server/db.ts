@@ -121,6 +121,15 @@ export async function listCustomers(accountId: string) {
   return db.select().from(customers).where(eq(customers.ownerId, accountId)).orderBy(asc(customers.name));
 }
 
+export async function getCustomer(accountId: string, customerId: string) {
+  const [row] = await db
+    .select()
+    .from(customers)
+    .where(and(eq(customers.id, customerId), eq(customers.ownerId, accountId)))
+    .limit(1);
+  return row ?? null;
+}
+
 export async function createCustomer(input: {
   ownerId: string;
   name: string;
@@ -1206,7 +1215,7 @@ export async function listOrders(accountId: string, opts: { driverId?: string | 
 export async function listOrderLinesForOrders(
   accountId: string,
   orderIds: string[],
-): Promise<Map<string, { equipmentName: string; deliveredQty: number; invoicedQty: number }[]>> {
+): Promise> {
   const out = new Map<string, { equipmentName: string; deliveredQty: number; invoicedQty: number }[]>();
   if (orderIds.length === 0) return out;
 
@@ -2340,29 +2349,6 @@ export async function updatePendingOrder(
 ): Promise<boolean> {
   const orderDateBs = edit.orderDateAd ? bsIso(adIsoToBs(edit.orderDateAd)) : null;
 
-  // ONE statement, so it is atomic for free — and it deliberately avoids
-  // `db.transaction`, because interactive transactions do not exist on the
-  // http driver this app is served by (see _core/db.ts): the sanctioned
-  // primitive there is a single statement, or `atomic()` when EVERY write can
-  // leave together without reading a result first.
-  //
-  // The edit cannot use `atomic()`. It is a read-then-decide write: the new
-  // lines must replace the old ones IF AND ONLY IF the order is still awaiting
-  // approval, and that verdict only exists once the guarded UPDATE has run.
-  // Batched statements share one snapshot and cannot see each other's writes, so
-  // a DELETE that consulted the UPDATE would delete nothing (or, worse, delete
-  // unconditionally and strip the lines off an already-approved order).
-  //
-  // `ok` is therefore evaluated ONCE and every later data-modifying CTE is gated
-  // on it (`WHERE EXISTS (SELECT 1 FROM ok)`). Per the Postgres rules on
-  // data-modifying CTEs the sub-statements share that one snapshot and cannot
-  // see each other's writes, so `del` can never delete the rows `ins` adds,
-  // whatever order they run in. A zero-row result means the order was already
-  // approved or rejected, which the caller turns into a CONFLICT.
-  //
-  // The lines arrive as ONE jsonb parameter and are unpacked with
-  // jsonb_to_recordset — the same values, one bind parameter, and no hand-built
-  // VALUES list to get wrong.
   const itemsJson = JSON.stringify(
     items.map((it) => ({
       equipment_id: it.equipmentId,
@@ -2406,8 +2392,6 @@ export async function updatePendingOrder(
     SELECT (SELECT count(*) FROM ok)::int AS updated
   `);
 
-  // Drizzle returns the rows array directly; tolerate a wrapping `{ rows }` too,
-  // so a landed edit can never be misread as a conflict.
   const rows = Array.isArray(result)
     ? (result as Array<{ updated: number }>)
     : (((result as unknown as { rows?: Array<{ updated: number }> }).rows) ?? []);
@@ -2529,7 +2513,7 @@ export async function setUserPassword(userId: string, passwordHash: string): Pro
  * Due balance for every customer in the account, as a Map keyed by customer id.
  * Used to show the current due on the Customers list in one round trip.
  */
-export async function customerDueMap(accountId: string): Promise<Map<string, number>> {
+export async function customerDueMap(accountId: string): Promise> {
   const [custRows, invRows, recRows] = await Promise.all([
     db
       .select({ id: customers.id, opening: customers.openingBalance })
@@ -2602,11 +2586,6 @@ export async function getCustomerLedger(
       .orderBy(desc(receipts.createdAt)),
   ]);
 
-  // ── what each invoice actually dispatched ──
-  // One query for every line behind this customer's invoices, aggregated per
-  // (invoice, equipment) so a line entered twice shows as one "2x" rather than
-  // two "1x". Billed qty is what the invoice charged for, so that is what the
-  // ledger names; a line with no billed qty falls back to the actual qty moved.
   const itemsByInvoice = new Map<string, { name: string; qty: number }[]>();
   if (invRows.length > 0) {
     const lineRows = await db
@@ -2637,8 +2616,6 @@ export async function getCustomerLedger(
     }
   }
 
-  // Debits (invoices, +) and credits (receipts, −) merged into one dated series,
-  // with the running balance stamped on each row by the shared helper.
   const opening = Number(customer.openingBalance) || 0;
   const built = buildLedger(
     opening,
@@ -2659,9 +2636,6 @@ export async function getCustomerLedger(
     })),
   );
 
-  // A BS range narrows the statement WITHOUT restarting the balance: everything
-  // before the range is carried into the opening figure, so the first row of the
-  // range shows what the customer actually owed that day.
   const { rows, totals } = sliceLedger(
     built.rows,
     opening,
@@ -2679,8 +2653,6 @@ export async function getCustomerLedger(
     },
     rows,
     totals,
-    // The full-history closing due, so a range-filtered statement can still show
-    // what the customer owes today beside what they owed at the range end.
     closingDueAll: built.totals.closingDue,
   };
 }
@@ -2749,18 +2721,9 @@ function round2(n: number): number {
 }
 
 // ── live GPS vehicle tracking ─────────────────────────────────────────────────
-//
-// A driver's device posts a ping every ~30s while a trip is active. The rows are
-// the trip's route history; the owner's map reads the newest ping per driver for
-// the live marker and the whole series for the route taken.
-//
-// Every read is account-scoped by `tripLocations.ownerId`, so a driver can only
-// ever see (and only ever write) their own owner's data.
 
-/** The statuses that count as "on a trip" — the driver is out with equipment. */
 export const ACTIVE_TRIP_STATUSES = ["on_transit", "on_rent"] as const;
 
-/** Store one location ping. Returns the created row. */
 export async function recordTripLocation(input: {
   ownerId: string;
   driverId: string;
@@ -2789,19 +2752,9 @@ export async function recordTripLocation(input: {
   return row;
 }
 
-/**
- * The newest ping for every driver in the account, with the driver, vehicle and
- * order it belongs to. This is what the owner's live map plots.
- *
- * `DISTINCT ON (driver_id)` is the cheapest way to get "latest per driver" in
- * one round trip; the outer query then joins the names.
- */
 export async function latestDriverLocations(accountId: string) {
   const tripVehicle = alias(vehicles, "loc_trip_vehicle");
   const currentCustomer = alias(customers, "loc_current_customer");
-  // ONE live trip per driver, chosen the same way as the ping: newest created_at
-  // wins. A driver holding two live orders would otherwise join TWICE and put
-  // two identical markers on the map, which reads as two drivers in one place.
   const liveTrip = db
     .selectDistinctOn([orders.lockedByDriverId], {
       id: orders.id,
@@ -2843,18 +2796,10 @@ export async function latestDriverLocations(accountId: string) {
       recordedAt: latest.recordedAt,
       driverName: drivers.name,
       driverPhone: drivers.phone,
-      // The vehicle on THIS trip — the locker's, which is the driver whose ping
-      // this row is. No fallback to `orders.vehicle_id`: that names the CREATING
-      // driver's truck, and showing it here is the bug this column exists to fix.
       vehicleName: tripVehicle.name,
       vehicleNumber: tripVehicle.number,
       orderStatus: orders.status,
       customerName: customers.name,
-      // The order the driver is out on RIGHT NOW, which is not always the order
-      // their last ping belongs to. A driver who locked a new order and has not
-      // moved yet still has a ping from the previous trip; the popup must name
-      // the new customer, not repeat the finished one. Null when they hold no
-      // live lock, and in that case the ping's own order is the honest answer.
       currentOrderId: liveTrip.id,
       currentOrderStatus: liveTrip.status,
       currentCustomerName: currentCustomer.name,
@@ -2865,28 +2810,13 @@ export async function latestDriverLocations(accountId: string) {
     .leftJoin(vehicles, eq(orders.vehicleId, vehicles.id))
     .leftJoin(tripVehicle, eq(orders.transitVehicleId, tripVehicle.id))
     .leftJoin(customers, eq(orders.customerId, customers.id))
-    // The driver's CURRENT live trip, resolved separately from the ping and
-    // already reduced to one row per driver, so no marker is duplicated.
     .leftJoin(liveTrip, eq(liveTrip.driverId, latest.driverId))
     .leftJoin(currentCustomer, eq(liveTrip.customerId, currentCustomer.id))
-    // ONLY trips that are still running. Without this the map kept plotting a
-    // driver's LAST known position forever: a returned order stayed on the
-    // "live" map as a vehicle parked wherever it finished, which reads exactly
-    // like a stale tracker rather than what it is. A driver who is not out with
-    // equipment has no business on a live map.
     .where(inArray(orders.status, [...ACTIVE_TRIP_STATUSES]))
     .orderBy(asc(drivers.name));
 }
 
-/**
- * Every order currently on a trip (on transit / on rent), with its driver,
- * vehicle and delivery site — the "active deliveries" the owner's map shows
- * alongside the live markers.
- */
 export async function activeTrips(accountId: string) {
-  // The driver shown against a live trip is the one who LOCKED it for dispatch —
-  // that is the driver actually out on the road, and it is whose ping the map
-  // plots. `driverId` (the creator) can be somebody else entirely.
   const transiter = alias(drivers, "trip_transiter");
   const tripVehicle = alias(vehicles, "trip_vehicle");
   return db
@@ -2903,11 +2833,8 @@ export async function activeTrips(accountId: string) {
       customerId: orders.customerId,
       customerName: customers.name,
       customerAddress: customers.address,
-      // The customer's SAVED site — where they usually are.
       latitude: customers.latitude,
       longitude: customers.longitude,
-      // The ACTUAL delivery point captured at dispatch. The map prefers this
-      // when present, because it is where the equipment really went.
       deliveryAddress: orders.deliveryAddress,
       deliveryLatitude: orders.deliveryLatitude,
       deliveryLongitude: orders.deliveryLongitude,
@@ -2925,36 +2852,11 @@ export async function activeTrips(accountId: string) {
     .orderBy(desc(orders.createdAt));
 }
 
-/**
- * The three states the tracking screen moves through, in one read.
- *
- * The screen is a state machine, and the states are decided by the DATA, not by
- * a client-side flag — so a reload, a second tab, or a poll landing mid-trip all
- * land on the same screen:
- *
- *   1. pre-dispatch  — an order is LOCKED but not yet dispatched. In this app
- *                      that is status `on_transit`: the driver has taken it, the
- *                      truck has not delivered. Show the driver + vehicle ONLY.
- *                      The customer's destination is deliberately withheld: the
- *                      truck has not arrived, and showing a drop-off before
- *                      dispatch invites the operator to read it as "delivered".
- *   2. active        — the equipment is with the customer: status `on_rent`.
- *                      Show the customer's delivery details (name, drop-off,
- *                      contact) beside the driver and vehicle.
- *   3. completed     — nothing active, but a delivery finished recently. Show the
- *                      driver + vehicle plus a "Recent delivery to" badge, so the
- *                      operator keeps context until the next lock.
- *
- * `recent` is the newest order that reached on_rent and has since left the active
- * set (returned), within the last 24 hours. Older than that and it is history,
- * not context.
- */
 export async function trackingBoard(accountId: string) {
   const transiter = alias(drivers, "board_transiter");
   const tripVehicle = alias(vehicles, "board_trip_vehicle");
 
   const [active, locked, recentRows] = await Promise.all([
-    // 2. active — the equipment is with the customer.
     db
       .select({
         orderId: orders.id,
@@ -2986,8 +2888,6 @@ export async function trackingBoard(accountId: string) {
       .where(and(eq(orders.ownerId, accountId), eq(orders.status, "on_rent")))
       .orderBy(desc(orders.createdAt)),
 
-    // 1. pre-dispatch — locked for dispatch, not yet delivered. Driver + vehicle
-    // only; the destination is withheld until the driver dispatches.
     db
       .select({
         orderId: orders.id,
@@ -3007,7 +2907,6 @@ export async function trackingBoard(accountId: string) {
       .where(and(eq(orders.ownerId, accountId), eq(orders.status, "on_transit")))
       .orderBy(desc(orders.createdAt)),
 
-    // 3. completed — the last delivery that came back, for the context badge.
     db
       .select({
         orderId: orders.id,
@@ -3036,7 +2935,6 @@ export async function trackingBoard(accountId: string) {
       .limit(1),
   ]);
 
-  // The item summary for the completed badge: "2x Pillar Farma, 1x Plate Farma".
   let recentItems: { name: string; qty: number }[] = [];
   const recent = recentRows[0] ?? null;
   if (recent) {
@@ -3061,7 +2959,6 @@ export async function trackingBoard(accountId: string) {
   };
 }
 
-/** The full route taken on one order, oldest first. */
 export async function tripHistory(accountId: string, orderId: string) {
   return db
     .select({
@@ -3078,12 +2975,6 @@ export async function tripHistory(accountId: string, orderId: string) {
     .orderBy(asc(tripLocations.recordedAt));
 }
 
-/**
- * The trip a driver is on right now, if any: the newest active order they LOCKED
- * for dispatch. Keyed on `lockedByDriverId`, not `driverId` — an order taken by
- * one driver and locked by another belongs to the locker's tracking card, and
- * the creator must not be tracked while sitting at home.
- */
 export async function driverActiveTrip(accountId: string, driverId: string) {
   const tripVehicle = alias(vehicles, "active_trip_vehicle");
   const [row] = await db
@@ -3094,7 +2985,6 @@ export async function driverActiveTrip(accountId: string, driverId: string) {
       customerAddress: customers.address,
       latitude: customers.latitude,
       longitude: customers.longitude,
-      // The driver's OWN vehicle on this trip, not the creating driver's.
       vehicleName: tripVehicle.name,
       vehicleNumber: tripVehicle.number,
       orderDateBs: orders.orderDateBs,
@@ -3115,7 +3005,6 @@ export async function driverActiveTrip(accountId: string, driverId: string) {
   return row ?? null;
 }
 
-/** When this driver last sent a ping, or null if they never have. */
 export async function lastPingAt(accountId: string, driverId: string) {
   const [row] = await db
     .select({ at: sql<Date | null>`max(${tripLocations.recordedAt})` })
@@ -3124,13 +3013,7 @@ export async function lastPingAt(accountId: string, driverId: string) {
   return row?.at ?? null;
 }
 
-/**
- * Orders that have location history, newest activity first — the list the owner
- * picks from to replay a route.
- */
 export async function tripsWithHistory(accountId: string, limit = 50) {
-  // The route belongs to the driver who LOCKED the order — that is whose pings
-  // are stored against it — so name that driver and their vehicle.
   const transiter = alias(drivers, "hist_transiter");
   const tripVehicle = alias(vehicles, "hist_trip_vehicle");
   const agg = db
@@ -3168,7 +3051,6 @@ export async function tripsWithHistory(accountId: string, limit = 50) {
     .limit(limit);
 }
 
-/** Set a customer's delivery-site coordinates (owner only, validated by router). */
 export async function setCustomerLocation(
   accountId: string,
   customerId: string,
@@ -3186,11 +3068,6 @@ export async function setCustomerLocation(
 export { adIsoToBs, bsIso };
 
 // ── audit trail ─────────────────────────────────────────────────────────────
-//
-// The owner can edit and delete ANY record, including orders that are already
-// dispatched or on rent. That power is only safe if it is reviewable, so every
-// such action writes a row to `audit_log`. These helpers are intentionally dumb
-// (plain inserts) — the ROUTER decides what happened, this just records it.
 
 export type AuditAction = "create" | "update" | "delete";
 export type AuditEntity =
@@ -3203,11 +3080,6 @@ export type AuditEntity =
   | "user"
   | "driver";
 
-/**
- * Append one audit entry. Never throws: an audit write failing must not roll
- * back the change the owner actually asked for, and must not mask a successful
- * edit as an error. The failure is reported to the server log instead.
- */
 export async function writeAuditLog(entry: {
   ownerId: string;
   actorUserId: string;
@@ -3241,7 +3113,6 @@ export async function writeAuditLog(entry: {
   }
 }
 
-/** The audit trail, newest first. Optionally narrowed to one entity kind. */
 export async function listAuditLog(accountId: string, opts: { entity?: string; limit?: number } = {}) {
   const conds = [eq(auditLog.ownerId, accountId)];
   if (opts.entity) conds.push(eq(auditLog.entity, opts.entity));
@@ -3254,19 +3125,7 @@ export async function listAuditLog(accountId: string, opts: { entity?: string; l
 }
 
 // ── cascade summaries ───────────────────────────────────────────────────────
-//
-// Deleting a record must not leave orphans behind. Two layers make that true:
-//  - the foreign keys in schema.ts cascade at the database level, and
-//  - these helpers count what is ABOUT to go, so the confirmation the owner sees
-//    states exactly what will be removed instead of a vague "are you sure?".
-//
-// Deleting an order also has to give back the quantity it is holding: an order
-// that was dispatched moved its Actual Qty onto `equipment.onRentQty`, so
-// dropping the row without releasing that would leave phantom equipment rented
-// forever. `recomputeOrderEffects` below is shared by delete and edit for that
-// reason — one place decides what an order's lines imply for stock.
 
-/** Everything that hangs off one order, counted for the delete confirmation. */
 export async function orderCascadeSummary(accountId: string, orderId: string) {
   const detail = await getOrder(accountId, orderId);
   if (!detail) return null;
@@ -3274,10 +3133,6 @@ export async function orderCascadeSummary(accountId: string, orderId: string) {
     .select({ id: invoices.id })
     .from(invoices)
     .where(and(eq(invoices.orderId, orderId), eq(invoices.ownerId, accountId)));
-  // Receipts are CUSTOMER-level (a payment on account), not attached to one
-  // order — so this counts the customer's receipts, and deletion deliberately
-  // does NOT remove them: the money was really received. Only deleting the
-  // customer takes their receipts with them.
   const receiptsForCustomer = detail.order.customerId
     ? await db
         .select({ id: receipts.id })
@@ -3309,14 +3164,6 @@ export async function orderCascadeSummary(accountId: string, orderId: string) {
   };
 }
 
-/**
- * Give back whatever stock an order is currently holding.
- *
- * An order that reached dispatch moved its Actual Qty from "available" onto
- * `equipment.onRentQty`. Deleting or re-lining that order without releasing the
- * hold leaves equipment permanently "on rent" with no order holding it — the
- * exact orphan this whole section exists to prevent. Returns the affected rows.
- */
 async function releaseOrderStock(
   accountId: string,
   orderId: string,
@@ -3349,18 +3196,6 @@ async function releaseOrderStock(
   });
 }
 
-/**
- * Delete an order and everything hanging off it.
- *
- * Rows that go: order_items, invoices, receipts against the order, every
- * trip_location ping (the route), stock movements, and the order itself. The
- * stock the order holds is released first when it was dispatched.
- *
- * Order of operations matters: release stock -> delete dependants -> delete the
- * order. The FK cascades would handle the children on their own, but doing it
- * explicitly means a partially-applied batch can never leave an invoice whose
- * order is gone, and it keeps this readable against the schema.
- */
 export async function deleteOrder(accountId: string, orderId: string) {
   const detail = await getOrder(accountId, orderId);
   if (!detail) return null;
@@ -3371,7 +3206,6 @@ export async function deleteOrder(accountId: string, orderId: string) {
 
   const scope = and(eq(orders.ownerId, accountId), eq(orders.id, orderId));
 
-  // Dependants first, then the order. One batch = one atomic request.
   await atomic((d) => {
     const stmts = [
       d.delete(tripLocations).where(and(eq(tripLocations.ownerId, accountId), eq(tripLocations.orderId, orderId))),
@@ -3386,22 +3220,6 @@ export async function deleteOrder(accountId: string, orderId: string) {
   return detail.order;
 }
 
-/**
- * Edit an order at ANY stage — including after dispatch, transit or on rent.
- *
- * This is the owner's escape hatch, not the driver's edit path: it touches the
- * header and re-writes the line items whatever the status is. Because it can
- * change quantities and rates after an invoice was already issued, it must
- * recompute everything derived:
- *   - the order's own line amounts and (if it holds stock) the on-rent quantities,
- *   - the invoice's subtotal / total / amountDue for that order,
- *   - which in turn moves the customer's due balance, because the ledger is
- *     derived (opening + invoices − receipts) rather than stored.
- *
- * The stock delta is applied as a difference (new actual − old actual), so
- * editing an order down releases equipment and editing it up holds more — the
- * total on rent always equals the sum of the orders that hold it.
- */
 export async function editOrderAnyStage(
   accountId: string,
   orderId: string,
@@ -3422,8 +3240,6 @@ export async function editOrderAnyStage(
   const orderDateBs = edit.orderDateAd ? bsIso(adIsoToBs(edit.orderDateAd)) : null;
   const holdsStock = before.order.status === "on_rent";
 
-  // 1. Header + lines, one statement so the header update and the line rewrite
-  //    cannot half-apply. The lines arrive as one jsonb parameter.
   const itemsJson = items
     ? JSON.stringify(
         items.map((it) => ({
@@ -3471,7 +3287,6 @@ export async function editOrderAnyStage(
     SELECT (SELECT count(*) FROM upd)::int AS updated
   `);
 
-  // 2. Re-read, then re-align stock and the invoice against the new lines.
   const after = await getOrder(accountId, orderId);
   if (!after) return null;
 
@@ -3504,7 +3319,6 @@ export async function editOrderAnyStage(
     }
   }
 
-  // 3. Keep the issued invoice in step with the lines the owner just changed.
   const subtotal = round2(after.items.reduce((s, it) => s + Number(it.lineAmount), 0));
   if (after.invoice) {
     const paid = round2(Number(after.invoice.total) - Number(after.invoice.amountDue));
@@ -3519,7 +3333,6 @@ export async function editOrderAnyStage(
 
 // ── customers ───────────────────────────────────────────────────────────────
 
-/** What deleting a customer takes with it. */
 export async function customerCascadeSummary(accountId: string, customerId: string) {
   const [c] = await db
     .select()
@@ -3556,14 +3369,6 @@ export async function customerCascadeSummary(accountId: string, customerId: stri
   };
 }
 
-/**
- * Delete a customer, their whole history, and every trace of them.
- *
- * A customer owns their orders, which in turn own invoices, receipts and route
- * pings. Deleting just the customer row would either fail on the FK or (with a
- * cascade) leave stock held by orders that no longer exist — so this walks the
- * tree explicitly, releasing stock for each order that is currently holding any.
- */
 export async function deleteCustomer(accountId: string, customerId: string) {
   const summary = await customerCascadeSummary(accountId, customerId);
   if (!summary) return null;
@@ -3577,8 +3382,6 @@ export async function deleteCustomer(accountId: string, customerId: string) {
 
   await atomic((d) => {
     const stmts = [
-      // Invoices and pings hang off ORDERS, which hang off the customer — so both
-      // go by subquery rather than by a column that does not exist on them.
       d.delete(tripLocations).where(
         and(
           eq(tripLocations.ownerId, accountId),
@@ -3604,7 +3407,6 @@ export async function deleteCustomer(accountId: string, customerId: string) {
   return summary;
 }
 
-/** Edit a customer. Any field, at any time. */
 export async function editCustomer(
   accountId: string,
   customerId: string,
@@ -3633,11 +3435,6 @@ export async function editCustomer(
     return row ?? null;
   }
 
-  // ── duplicate guard ──
-  // An edit can create a duplicate just as easily as a create: renaming "Ram"
-  // to "Annapurna Infra" while it already holds that number would leave two rows
-  // for one customer. The row being edited is excluded, so saving an unchanged
-  // record is never refused.
   const [current] = await db
     .select()
     .from(customers)
@@ -3660,7 +3457,6 @@ export async function editCustomer(
 
 // ── equipment / vehicles ────────────────────────────────────────────────────
 
-/** What deleting a piece of equipment takes with it. */
 export async function equipmentCascadeSummary(accountId: string, equipmentId: string) {
   const [e] = await db
     .select()
@@ -3688,21 +3484,10 @@ export async function equipmentCascadeSummary(accountId: string, equipmentId: st
   };
 }
 
-/**
- * Delete a piece of equipment, its stock ledger and every order line that used
- * it.
- *
- * Order lines are removed rather than left pointing at nothing — an order with a
- * line whose equipment is gone renders as an orphan line with no name and no
- * unit, and its amount silently disappears from the total. Any order left with
- * no lines at all is deleted too, and any order that survives gets its invoice
- * re-derived so the customer's due stays truthful.
- */
 export async function deleteEquipment(accountId: string, equipmentId: string) {
   const summary = await equipmentCascadeSummary(accountId, equipmentId);
   if (!summary) return null;
 
-  // Orders touched by this equipment, before their lines disappear.
   const touched = await db
     .select({ orderId: orderItems.orderId })
     .from(orderItems)
@@ -3718,18 +3503,16 @@ export async function deleteEquipment(accountId: string, equipmentId: string) {
     return stmts as unknown as [BatchItem<"pg">, ...BatchItem<"pg">[]];
   });
 
-  // Re-derive every order that used it: drop the ones with no lines left, and
-  // rebalance the invoice of the ones that still have some.
   for (const orderId of touchedIds) {
     const detail = await getOrder(accountId, orderId);
     if (!detail) continue;
     if (detail.items.length === 0) {
       await atomic((d) => {
         const stmts = [
-      d.delete(tripLocations).where(and(eq(tripLocations.ownerId, accountId), eq(tripLocations.orderId, orderId))),
-      d.delete(receipts).where(and(eq(receipts.ownerId, accountId), eq(receipts.customerId, detail.order.customerId))),
-      d.delete(invoices).where(and(eq(invoices.ownerId, accountId), eq(invoices.orderId, orderId))),
-      d.delete(orders).where(and(eq(orders.id, orderId), eq(orders.ownerId, accountId))),
+          d.delete(tripLocations).where(and(eq(tripLocations.ownerId, accountId), eq(tripLocations.orderId, orderId))),
+          d.delete(receipts).where(and(eq(receipts.ownerId, accountId), eq(receipts.customerId, detail.order.customerId))),
+          d.delete(invoices).where(and(eq(invoices.ownerId, accountId), eq(invoices.orderId, orderId))),
+          d.delete(orders).where(and(eq(orders.id, orderId), eq(orders.ownerId, accountId))),
         ];
         return stmts as unknown as [BatchItem<"pg">, ...BatchItem<"pg">[]];
       });
@@ -3748,7 +3531,6 @@ export async function deleteEquipment(accountId: string, equipmentId: string) {
   return summary;
 }
 
-/** Edit a piece of equipment. `totalQty` may not drop below what is on rent. */
 export async function editEquipmentAnyStage(
   accountId: string,
   equipmentId: string,
@@ -3772,13 +3554,6 @@ export async function editEquipmentAnyStage(
   return row ? ({ ok: true as const, row } as const) : null;
 }
 
-/** What deleting a vehicle would touch.
- *
- * Counts every record that still names the truck, because that is what decides
- * how a delete is allowed to behave: a vehicle nothing refers to can go, one
- * with history behind it is retired instead so no report is left pointing at a
- * row that vanished.
- */
 export async function vehicleCascadeSummary(accountId: string, vehicleId: string) {
   const [v] = await db
     .select()
@@ -3801,14 +3576,10 @@ export async function vehicleCascadeSummary(accountId: string, vehicleId: string
       .select({ id: vehicleAssignments.id })
       .from(vehicleAssignments)
       .where(and(eq(vehicleAssignments.vehicleId, vehicleId), eq(vehicleAssignments.ownerId, accountId))),
-    // The audit trail names the truck in `targetId`, so a hard delete would leave
-    // entries whose subject cannot be looked up.
     db
       .select({ id: auditLog.id })
       .from(auditLog)
       .where(and(eq(auditLog.ownerId, accountId), eq(auditLog.entity, "vehicle"), eq(auditLog.targetId, vehicleId))),
-    // A truck that is physically out on a trip cannot be retired mid-trip: it is
-    // the vehicle the owner's live map is labelling.
     db
       .select({ id: orders.id })
       .from(orders)
@@ -3832,29 +3603,11 @@ export async function vehicleCascadeSummary(accountId: string, vehicleId: string
     auditEntries: audits.length,
     references,
     onActiveTrip: activeTrip.length > 0,
-    /** Nothing names it, so the row can actually go. */
     canHardDelete: references === 0 && activeTrip.length === 0,
     orderIds: ords.map((o) => o.id),
   };
 }
 
-/**
- * Delete a vehicle, safely.
- *
- * Three outcomes, in order of what the history needs:
- *
- *   * the truck is on an active trip right now \u2014 REFUSED. Retiring it would
- *     leave the owner's live map labelling a trip with a vehicle the app has
- *     just hidden, and the stock it is carrying is still in the driver's hands.
- *   * nothing refers to it \u2014 the row is genuinely deleted.
- *   * something refers to it \u2014 the row is RETIRED (is_active = false), so it
- *     disappears from every picker while orders, assignments and audit entries
- *     keep naming it. No orphaned reference, no report that crashes, and the
- *     owner can put it back in service in one click.
- *
- * Nothing is ever nulled out of an order as a side effect of this: a completed
- * trip keeps the plate it ran on.
- */
 export async function deleteVehicle(accountId: string, vehicleId: string) {
   const summary = await vehicleCascadeSummary(accountId, vehicleId);
   if (!summary) return { ok: false as const, reason: "not_found" as const };
@@ -3874,7 +3627,6 @@ export async function deleteVehicle(accountId: string, vehicleId: string) {
 
 // ── receipts / invoices ─────────────────────────────────────────────────────
 
-/** Edit a receipt (amount, mode, reference, date). Returns the updated row. */
 export async function editReceipt(
   accountId: string,
   id: string,
@@ -3902,7 +3654,6 @@ export async function editReceipt(
   return row ?? null;
 }
 
-/** Edit an invoice's amounts directly. Used when the owner corrects a bill. */
 export async function editInvoice(
   accountId: string,
   id: string,
@@ -3925,7 +3676,6 @@ export async function editInvoice(
   return row ?? null;
 }
 
-/** What deleting an invoice takes with it. */
 export async function invoiceCascadeSummary(accountId: string, id: string) {
   const [inv] = await db
     .select()
@@ -3947,13 +3697,10 @@ export async function invoiceCascadeSummary(accountId: string, id: string) {
   return {
     invoiceNo: inv.invoiceNo,
     total: Number(inv.total),
-    // Receipts are customer-level, not invoice-level: deleting the invoice does
-    // NOT delete the money received, it just removes the bill from the ledger.
     linkedReceipts: recs.length,
   };
 }
 
-/** Delete one invoice. Receipts stay — they are payments actually received. */
 export async function deleteInvoice(accountId: string, id: string) {
   const summary = await invoiceCascadeSummary(accountId, id);
   if (!summary) return null;
@@ -3963,7 +3710,6 @@ export async function deleteInvoice(accountId: string, id: string) {
 
 // ── users / drivers ─────────────────────────────────────────────────────────
 
-/** What deleting a user takes with it. */
 export async function userCascadeSummary(accountId: string, userId: string) {
   const [u] = await db
     .select({ id: users.id, email: users.email, name: users.name })
@@ -3978,7 +3724,6 @@ export async function userCascadeSummary(accountId: string, userId: string) {
     .where(and(eq(drivers.userId, userId), eq(drivers.ownerId, accountId)))
     .limit(1);
 
-  // Orders this person is named on in any of the three actor roles.
   const ords = await db
     .select({ id: orders.id })
     .from(orders)
@@ -4006,18 +3751,6 @@ export async function userCascadeSummary(accountId: string, userId: string) {
   };
 }
 
-/**
- * Delete a user account (and their driver profile, if any).
- *
- * Orders are NEVER deleted with a person: a transaction is a fact about the
- * business, not about the person who happened to be logged in. The actor columns
- * are nullable and `onDelete: set null`, so the FK does the right thing — the
- * order survives, its history shows "—" for whoever is gone, and the audit log
- * (which stores the actor name as text) still says who did what.
- *
- * The owner's own account cannot be deleted: that would orphan the entire
- * business. The router enforces it too, but the guard belongs here as well.
- */
 export async function deleteUser(accountId: string, userId: string) {
   const summary = await userCascadeSummary(accountId, userId);
   if (!summary) return { ok: false as const, reason: "not_found" as const };
@@ -4025,16 +3758,12 @@ export async function deleteUser(accountId: string, userId: string) {
 
   const [target] = await db.select({ id: users.id }).from(users).where(eq(users.id, userId)).limit(1);
   if (!target) return { ok: false as const, reason: "not_found" as const };
-  // Only accounts belonging to THIS business may be deleted.
   const profile = await getProfile(userId);
   if (profile && profile.ownerId !== accountId) return { ok: false as const, reason: "not_found" as const };
 
   await atomic((d) => {
     const stmts = [
-      // Clear the actor references first so no FK ever blocks the delete, even if
-      // a cascade rule were missing.
       d.update(orders).set({ lockedByDriverId: null }).where(sql`${orders.lockedByDriverId} IN (SELECT id FROM drivers WHERE user_id = ${userId}::uuid)`),
-      // The driver profile cascades to its orders' nullable FKs via set-null.
       d.delete(drivers).where(and(eq(drivers.userId, userId), eq(drivers.ownerId, accountId))),
       d.delete(profiles).where(eq(profiles.userId, userId)),
       d.delete(users).where(eq(users.id, userId)),
@@ -4045,7 +3774,6 @@ export async function deleteUser(accountId: string, userId: string) {
   return { ok: true as const, summary };
 }
 
-/** Edit a user's display name / email (owner only). */
 export async function editUser(
   accountId: string,
   userId: string,
@@ -4079,20 +3807,9 @@ export async function editUser(
     .limit(1);
   return row ?? null;
 }
-// ── SMS notification log ──────────────────────────────────────────────────────
-//
-// The read/write side of `sms_notifications`. Kept here with the other business
-// queries so the router stays thin and the log is owner-scoped like everything
-// else.
 
-/**
- * The human order reference, derived the same way the Stock report derives it:
- * the day the order was raised plus its position that day (ORD-2026-10-26-2).
- *
- * Recomputed from the account's own orders rather than stored, so the reference
- * in an SMS always matches what the Orders screen shows. Returns null when the
- * order is gone.
- */
+// ── SMS notification log ──────────────────────────────────────────────────────
+
 export async function orderRefFor(accountId: string, orderId: string): Promise<string | null> {
   const [target] = await db
     .select({ id: orders.id, dateAd: orders.orderDateAd, createdAt: orders.createdAt })
@@ -4110,14 +3827,6 @@ export async function orderRefFor(accountId: string, orderId: string): Promise<s
   return `ORD-${target.dateAd}-${idx + 1}`;
 }
 
-/**
- * Everything an SMS needs about one order, in one place: the customer's name and
- * phone, the derived order reference, and the equipment lines with the quantity
- * that actually moved.
- *
- * Returns null when the order does not belong to this account, so a caller can
- * never text a customer about another business's order.
- */
 export async function getOrderSmsContext(accountId: string, orderId: string) {
   const [row] = await db
     .select({
@@ -4154,7 +3863,6 @@ export async function getOrderSmsContext(accountId: string, orderId: string) {
   };
 }
 
-/** Record one SMS attempt — sent, failed or skipped. Never throws. */
 export async function logSmsNotification(input: {
   ownerId: string;
   orderId?: string | null;
@@ -4187,15 +3895,11 @@ export async function logSmsNotification(input: {
       .returning();
     return row ?? null;
   } catch (e) {
-    // The log is a record of the attempt, not the attempt itself. If writing it
-    // fails, the order flow must still be unaffected — so this is logged and
-    // swallowed rather than thrown.
     console.error("[sms] failed to write notification log", e instanceof Error ? e.message : e);
     return null;
   }
 }
 
-/** The most recent SMS attempts for this account, newest first. */
 export async function listSmsNotifications(accountId: string, limit = 100) {
   return db
     .select()
@@ -4205,7 +3909,6 @@ export async function listSmsNotifications(accountId: string, limit = 100) {
     .limit(Math.min(Math.max(1, limit), 500));
 }
 
-/** Counts by outcome, for the settings page's status card. */
 export async function smsNotificationSummary(accountId: string) {
   const rows = await db
     .select({ status: smsNotifications.status, n: sql<number>`count(*)::int` })
@@ -4224,12 +3927,7 @@ export async function smsNotificationSummary(accountId: string) {
 }
 
 // ── message-sending settings ────────────────────────────────────────────────
-//
-// One row per account, created on first write. A missing row means 'off', which
-// is what lets the read path work on a fresh database with no seeding: the
-// feature is simply inactive until the owner chooses a mode.
 
-/** The owner's chosen mode. Absent row (or a row holding junk) reads as 'off'. */
 export async function getMessageMode(accountId: string): Promise<MessageMode> {
   const [row] = await db
     .select({ mode: messageSettings.messageMode })
@@ -4240,7 +3938,6 @@ export async function getMessageMode(accountId: string): Promise<MessageMode> {
   return MESSAGE_MODES.includes(mode as MessageMode) ? (mode as MessageMode) : "off";
 }
 
-/** Upsert the mode. Returns what is now stored. */
 export async function setMessageMode(accountId: string, mode: MessageMode): Promise<MessageMode> {
   await db
     .insert(messageSettings)
@@ -4252,16 +3949,6 @@ export async function setMessageMode(accountId: string, mode: MessageMode): Prom
   return getMessageMode(accountId);
 }
 
-/**
- * Every customer of this account, with the phone number their details record
- * holds. This is the pick-list the owner ticks recipients from — the number is
- * ALWAYS taken from here, never typed at send time, which is what the request
- * asked for ("contact numbers must be picked from the customer details").
- *
- * `dialable` is computed server-side so the UI can disable a tick box for a
- * customer who could not receive a message anyway, rather than letting the
- * owner select them and then reporting a skip.
- */
 export async function listCustomersForMessaging(accountId: string) {
   const rows = await db
     .select({
@@ -4281,14 +3968,12 @@ export async function listCustomersForMessaging(accountId: string) {
       name: c.name,
       phone: c.phone ?? null,
       address: c.address ?? null,
-      /** The local Nepali number that would actually be dialled, or null. */
       normalised: dialable,
       dialable: dialable !== null && isValidSmsPasalNumber(dialable),
     };
   });
 }
 
-/** The customer rows behind a set of ids, scoped to this account. */
 export async function getCustomersForMessaging(accountId: string, ids: string[]) {
   if (ids.length === 0) return [];
   return db
@@ -4300,4 +3985,3 @@ export async function getCustomersForMessaging(accountId: string, ids: string[])
     .from(customers)
     .where(and(eq(customers.ownerId, accountId), inArray(customers.id, ids)));
 }
-
