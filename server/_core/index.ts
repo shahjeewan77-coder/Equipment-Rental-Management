@@ -57,3 +57,11 @@ const port = env.isProd ? env.port : env.apiPort;
 serve({ fetch: app.fetch, port });
 // eslint-disable-next-line no-console
 console.log(`[server] listening on :${port} (${env.isProd ? "prod" : "dev-api"})`);
+if (!process.env.VERCEL) {
+  serve({
+    fetch: app.fetch,
+    port: Number(process.env.PORT) || 3000,
+  });
+}
+
+export default app;
