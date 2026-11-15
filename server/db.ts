@@ -1009,7 +1009,7 @@ export async function listOrders(accountId: string, opts: { driverId?: string | 
 export async function listOrderLinesForOrders(
   accountId: string,
   orderIds: string[],
-): Promise> {
+) {
   const out = new Map<string, { equipmentName: string; deliveredQty: number; invoicedQty: number }[]>();
   if (orderIds.length === 0) return out;
 
@@ -2059,7 +2059,7 @@ export async function setUserPassword(userId: string, passwordHash: string): Pro
 
 // ── customer ledger & receipts ────────────────────────────────────────────────
 
-export async function customerDueMap(accountId: string): Promise> {
+export async function customerDueMap(accountId: string) {
   const [custRows, invRows, recRows] = await Promise.all([
     db
       .select({ id: customers.id, opening: customers.openingBalance })
@@ -3163,7 +3163,7 @@ export async function deleteVehicle(accountId: string, vehicleId: string) {
   return { ok: true as const, mode: "deleted" as const, summary };
 }
 
-// ── receipts / invoices ─────────────────────────────────────────────────────
+// ── receipts / invoices ────────────────────────────────────────────────     
 
 export async function editReceipt(
   accountId: string,
