@@ -5,7 +5,7 @@
   "outputDirectory": "dist/public",
   "functions": {
     "api/index.ts": {
-      "includeFiles": "dist/**"
+      "includeFiles": "{dist/**,node_modules/@hono/**}"
     }
   },
   "rewrites": [
