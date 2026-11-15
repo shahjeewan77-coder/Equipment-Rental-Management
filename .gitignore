@@ -6,3 +6,6 @@ dist/
 .webapp-logs/
 *.log
 .DS_Store
+
+.vercel
+.env*
