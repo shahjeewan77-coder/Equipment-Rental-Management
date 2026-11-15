@@ -1,0 +1,12 @@
+import "dotenv/config";
+import pg from "pg";
+const c = new pg.Client({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+await c.connect();
+const cols = await c.query("select column_name from information_schema.columns where table_name='users' order by ordinal_position");
+console.log("USER COLS:", cols.rows.map(r=>r.column_name).join(", "));
+const u = await c.query("select * from users limit 20");
+for (const r of u.rows) console.log(JSON.stringify({id:r.id, email:r.email, phone:r.phone, role:r.role, name:r.display_name||r.name}));
+const d = await c.query("select * from drivers limit 20");
+console.log("DRIVERS:");
+for (const r of d.rows) console.log(JSON.stringify(r));
+await c.end();
