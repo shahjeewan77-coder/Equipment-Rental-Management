@@ -2800,7 +2800,7 @@ export async function editOrderAnyStage(
         notes         = ${edit.notes === undefined ? sql`notes` : sql`${edit.notes}::text`},
         status        = COALESCE(${edit.status ?? null}::text, status),
         order_date_ad = COALESCE(${edit.orderDateAd ?? null}::text, order_date_ad),
-        order_date_bs = COALESCE(${orderDateBs}::text, order_date_bs)
+        order_date_bs = COALESCE(${orderDateBs ?? null}::text, order_date_bs)
       WHERE id = ${orderId}::uuid AND owner_id = ${accountId}::uuid
       RETURNING id
     ),
