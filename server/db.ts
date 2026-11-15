@@ -2993,7 +2993,7 @@ export async function editCustomer(
   return row ?? null;
 }
 
-// ── equipment / vehicles ────────────────────────────────────────────────    
+// ── equipment / vehicles ────────────────────────────────────────────────────
 
 export async function equipmentCascadeSummary(accountId: string, equipmentId: string) {
   const [e] = await db
